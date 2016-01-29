@@ -13,14 +13,14 @@ our $bare=0;
 
 my $banner="extrsql v" . $maj . "." . $min . " - ccsgbd 2016";
 
-my $DATEFORMAT="YYYY-MM-DD HH24:MI:SS";
-my $DATEFORMATREGEXP='\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}';
-
 # forward declarations
 sub display_top;      
 sub display_history;      
 sub display_sqlid;
 sub get_dbid;
+
+my $DATEFORMAT="YYYYMMDDHH24MISS";
+my $DISPLAYDATEFORMAT="YYYY-MM-DD HH24:MI:SS";
 
 # --------------------------------------------------------------------------
 =head1 usage
@@ -44,7 +44,9 @@ usage:
 
          Displays awrsqlreports for sqlid xxxxx in the optionnally
          specified range sssss to eeeeee.
-         Range bounds are specified as "YYYY-MM-DD HH24:MI:SS" 
+         Range bounds are specified as dates where the year (YYYY) comes before the month (MM),
+         coming before the day, etc. Only digits are taken into account, and incomplete dates
+         are completed with conservative values (0 or 1).
          If start is not specified, end is not taken into account.
          If end is not specified, it defaults to now.
          If range is not specified, the latest available range (instance lifetime) is used.
@@ -84,15 +86,23 @@ __HERE
 
 # --------------------------------------------------------------------------
 =head1 check_date_format
-   Valide que le paramètre est une chaine de caractère au format
-   "YYYY-MM-DD HH24:MI:SS" ($DATEFORMAT)
-   Ne valide pas que la chaîne est une date valide toutefois.
+   Parse grossièrement une chaine de caractères pour en extraire au 
+   maximum 14 chiffres dont on suppose qu'il s'agit d'une date au format
+   YYYYMMDDHH24MISS. Les dates partielles sont complétées avec 
+   la sous-chaine appropriée du début de l'année courante
+
 =head2 paramètres
    Une chaine de caractères
 =cut   
 sub check_date_format {
    my $date = shift;
-   return ($date =~ /$DATEFORMATREGEXP/)?1:0;
+   $date =~ s/\D//g;		# take only digits into account
+   $date = substr($date,0,14);  # maximum date length is 14 (YYYYMMDDHHMISS)
+   if (length($date) < 14) {
+	my $generic_filler = (localtime())[5]+1900 . "0101000000";
+	$date .= substr($generic_filler, length($date) - 14 );
+   } 
+   return $date;
 } # check_date_format 
 
 # --------------------------------------------------------------------------
@@ -174,12 +184,8 @@ sub main {
    
    if ($help) { usage(); exit(0); }
    # Validate start / end
-   for my $k ($start,$end) {
-      if ($verbose) { print "Checking date " . nvl($k) . "\n"; }
-      if (defined $k && ! check_date_format( $k )) { 
-         usage( $k . " does not look like \"$DATEFORMAT\"\n" );
-      }
-   }
+   if (defined $start ) { $start = check_date_format( $start ); }
+   if (defined $end   ) { $end   = check_date_format( $end   ); }
 
    # Validate sort criterion
    if (defined $sort) {
@@ -333,8 +339,8 @@ sub display_range {
    my ($dbh, $min, $max) = @_;
    my $sth = $dbh->prepare( qq(
       select 
-      to_char( min(begin_interval_time),'$DATEFORMAT') , 
-      to_char( max(end_interval_time) ,'$DATEFORMAT')
+      to_char( min(begin_interval_time),'$DISPLAYDATEFORMAT') , 
+      to_char( max(end_interval_time) ,'$DISPLAYDATEFORMAT')
       from dba_hist_snapshot 
       where snap_id between :bsnap and :esnap
       and dbid = :dbid
