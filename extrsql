@@ -1,0 +1,806 @@
+#!/bin/env perl
+
+use DBI;
+use DBD::Oracle qw(:ora_session_modes :ora_types);
+use strict;
+
+my $prog = "extrsql";
+my $maj = 0;
+my $min = 3;
+our $verbose;
+our $wrap=80;
+our $bare=0;
+
+my $banner="extrsql v" . $maj . "." . $min . " - ccsgbd 2016";
+
+my $DATEFORMAT="YYYY-MM-DD HH24:MI:SS";
+my $DATEFORMATREGEXP='\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}';
+
+# forward declarations
+sub display_top;      
+sub display_history;      
+sub display_sqlid;
+sub get_dbid;
+
+# --------------------------------------------------------------------------
+=head1 usage
+   Aide en ligne
+=head2 paramètres
+   Aucun
+=cut   
+sub usage {
+   my $msg = shift;
+   if ($msg) { print $msg; }
+print <<"__HERE";
+
+$banner
+
+usage:   
+   $prog   --help
+
+         Displays this.
+
+   $prog   --sqlid xxxxx [ --start sssss [ --end eeeee]] [--instance iiiii] [--binds] [--wrap wwww]
+
+         Displays awrsqlreports for sqlid xxxxx in the optionnally
+         specified range sssss to eeeeee.
+         Range bounds are specified as "YYYY-MM-DD HH24:MI:SS" 
+         If start is not specified, end is not taken into account.
+         If end is not specified, it defaults to now.
+         If range is not specified, the latest available range (instance lifetime) is used.
+         Instance may be specified; it defaults to the current instance
+         Optionnally, captured bind variables can be displayed.
+         By default, sql statements are wrapped at 80 columns.
+         This can be tweaked with the wrap option
+
+   $prog   --history xxxxx [ --start sssss [ --end eeeee]] [--instance iiiii] 
+
+         Displays an history of the specified xxxxx sql_id
+
+   $prog --top ttttt  [--sort xxxxx] [ --start sssss [ --end eeeee]] [--instance iiiii] [--pl]
+         
+         Displays top ttttt SQL over the range specified by start/end.
+         If range is not specified, it defaults to everything since
+         last instance startup. 
+         By default, top n is done on the elapsed time criterion.
+         Sort can be explicitly specified with those values:
+
+            - ela         Elapsed time
+            - elapx       Elapsed time per execution
+            - cpu         CPU time
+            - cpupx       CPU time per execution
+            - exec        Nb executions
+            - pr          Physical reads
+            - lr          Logical reads
+            - iow         IO wait
+
+	The --pl switch includes plsql statements in the top. By default, pl/sql is excluded
+
+The --verbose options might display more information
+__HERE
+   exit(0);
+} # usage
+
+
+# --------------------------------------------------------------------------
+=head1 check_date_format
+   Valide que le paramètre est une chaine de caractère au format
+   "YYYY-MM-DD HH24:MI:SS" ($DATEFORMAT)
+   Ne valide pas que la chaîne est une date valide toutefois.
+=head2 paramètres
+   Une chaine de caractères
+=cut   
+sub check_date_format {
+   my $date = shift;
+   return ($date =~ /$DATEFORMATREGEXP/)?1:0;
+} # check_date_format 
+
+# --------------------------------------------------------------------------
+=head1 check_sort_format
+   Valide que le paramètre est une critère de tri valide, ie inclus dans 
+   la table des critères définie ici.
+=head2 paramètres
+   Une chaine de caractères
+=cut   
+{
+   my %valid_sort_crit = (
+         elapx   => "elapsed_per_exec",
+         cpupx   => "cpu_per_exec",
+         ela     => "elapsed_time",
+         cpu     => "cpu_time",
+         exec    => "execs",
+         pr      => "disk_reads",
+         dr      => "disk_reads",
+         lr      => "buffer_gets",
+         bg      => "buffer_gets",
+         io      => "iowait",
+   );
+   sub check_sort_format {
+      my $sort = shift;
+      return (defined $valid_sort_crit{ $sort });
+   } # check_sort_format 
+
+   sub get_sort_key {
+      my $sort = shift;
+      return $valid_sort_crit{ $sort };
+   } # get_sort_key 
+}
+
+# --------------------------------------------------------------------------
+=head1 main
+   Traitement des parametres en ligne de commande
+   Connexion à Oracle
+   Lancement du traitement approprié, alternativement:
+      display_top     - affiche le top n des SQL
+      display_sqlid   - affiche un sqlid specifique
+=head2 paramètres
+   Aucun
+=cut   
+sub main {
+   use Getopt::Long;
+   my $help;
+   my $sql_id;
+   my $top;
+   my $sort;
+   my $range;
+   my $start;
+   my $end;
+   my $binds;
+   my $trace;
+   my $pinst = 0;
+   my $history;
+   my $pl;
+
+   my $default_topn = 10;       # Default # of sqlid to display
+   my $default_sort = "ela";   # Default sort criterion
+
+   GetOptions(
+               "help"       => \$help,
+               "sqlid=s"    => \$sql_id,
+               "top:i"      => \$top,
+               "sort:s"     => \$sort,
+               "range"      => \$range,
+               "start=s"    => \$start,
+               "end=s"      => \$end,
+               "binds"      => \$binds,
+               "verbose"    => \$verbose,
+               "wrap"       => \$wrap,
+               "history=s"  => \$history,
+               "trace"      => \$trace,
+               "instance:i" => \$pinst,
+               "bare"       => \$bare,
+               "plsql"      => \$pl,
+   );
+   
+   if ($help) { usage(); exit(0); }
+   # Validate start / end
+   for my $k ($start,$end) {
+      if ($verbose) { print "Checking date " . nvl($k) . "\n"; }
+      if (defined $k && ! check_date_format( $k )) { 
+         usage( $k . " does not look like \"$DATEFORMAT\"\n" );
+      }
+   }
+
+   # Validate sort criterion
+   if (defined $sort) {
+      check_sort_format( $sort ) || usage( $sort . " is not a valid sort criterion\n"); 
+   } else { $sort = $default_sort; }
+
+   my $dbh = DBI->connect("dbi:Oracle:", "", "", { ora_session_mode => ORA_SYSDBA }  )
+    || die "Cant connect to Oracle: $!\n";
+
+   if ($trace) { 
+      $dbh->do( "alter session set tracefile_identifier = '$prog' events = '10046 trace name context forever, level 12'"); }
+
+   # setup dbid and instance number
+   {
+     my $dbid = get_dbid( $dbh );
+     my $dbname =  get_dbname( $dbh );
+     my $inst = get_instance( $dbh, $pinst ) unless (defined $history && $pinst<1);
+   }
+   if (defined $top) {
+      if (defined $sql_id || defined $range) { usage( "Use top or (sqlid and/or range)\n"); }
+      $top = ($top>0)?$top:$default_topn;
+      display_top($dbh, $top, $sort, $start, $end, (defined $pl)?1:0);
+   } elsif (defined $sql_id) {
+      display_sqlid($dbh, $sql_id, $binds, $start, $end);
+   } elsif (defined $history) {
+      display_history( $dbh, $history, $start, $end, $pinst );
+   } else { usage(); }
+} # main
+
+# --------------------------------------------------------------------------
+=head1 nvl
+   Renvoie "undef" à la place d'une variable si elle n'est pas définie
+=head2 paramètres
+=over 3
+   =item varname
+      Une variable
+=back
+=cut
+sub nvl {
+   my ($var) = @_;
+   return ($var)?$var:"undef";
+} # nvl
+
+# --------------------------------------------------------------------------
+=head1 appropriate_range
+   Détermine l'intervalle de snap_id correct pour les paramètres
+   
+=head2 paramètres
+=over 3
+   =item dbh
+      Handle live de la base de données
+   =item sql_id
+      L'identifiant de l'ordre que l'on extrait
+   =item start
+      debut de l'intervalle à considérer
+   =item start
+      fin de l'intervalle à considérer
+=back
+La fonction retourne une paire de snap_id.
+Si sql_id est défini, mais ni start ni end, la paire correspond à 
+l'intervalle le plus récent dans lequel snap_id est présent.
+Si sql_id est défini et start et/ou end est défini, on ramène l'intervalle
+contenant start et finissant soit par le dernier snap de la vie de 
+l'instance, soit par end - à condition que sql_id y soit présent.
+Si sql_id n'est pas défini et start est défini, on ramène l'intervalle
+commençant par start et finissant avec l'instance.
+Si ni sql_id, ni start ne sont définis, la paire correspond à l'intervalle
+de la dernière ouverture de la base.
+=cut   
+sub appropriate_range {
+   my ($dbh, $sql_id, $start, $end ) = @_;
+   my ($bsnap, $esnap, $sth);
+   if (defined $sql_id) { 
+         if ($verbose) { printf( "sql_id present - First interval check for %s - %s\n", nvl($start), nvl($end) ); }
+         ($bsnap,$esnap) = appropriate_range( $dbh, undef, $start, $end );
+         if ($verbose) { printf("found valid instance snap interval %s - %s\n", nvl($bsnap),nvl($esnap )); }
+         $sth =$dbh->prepare( q(
+            select min(snap_id), max(snap_id) from dba_hist_sqlstat
+            where sql_id = :sql_id
+            and snap_id between :bsnap and :esnap
+         ));
+            
+         $sth->bind_param( ":sql_id", $sql_id );
+         $sth->bind_param( ":bsnap",  $bsnap );
+         $sth->bind_param( ":esnap",  $esnap );
+   } else { 
+      if (defined $start) {
+         # no $sql_id, but a $start time is defined
+         if ($verbose) { printf( "instance wide  - interval check with a starting point for %s - %s\n", nvl($start), nvl($end) ); }
+         $sth = $dbh->prepare( qq(
+               select minsnap, maxsnap from
+                  (select min(snap_id) minsnap
+                  from dba_hist_snapshot
+                  where
+                     to_date(:dstart, '$DATEFORMAT') <= begin_interval_time 
+                  and instance_number = :inst
+                  and dbid = :dbid
+                  ),
+                  (select max(snap_id) maxsnap
+                  from dba_hist_snapshot
+                  where
+                     (to_date(:dend, '$DATEFORMAT') >= begin_interval_time 
+                     or :dend is null)
+                  and instance_number = :inst
+                  and dbid = :dbid)
+         ));
+         $sth->bind_param( ":dstart", $start );
+         $sth->bind_param( ":dend",   $end );
+         $sth->bind_param( ":dbid",   get_dbid() );
+         $sth->bind_param( ":inst",   get_instance() );
+      } else { 
+         # no $sql_id and no $start : we get the current instance lifespan
+         if ($verbose) { printf( "instance wide  - interval check without starting point\n"); }
+         $sth =$dbh->prepare( q(
+            select min(snap_id), max(snap_id) 
+            from 
+               dba_hist_snapshot 
+            where 
+                instance_number = :inst
+            and dbid = :dbid
+            group by startup_time
+            order by startup_time desc
+         ));
+         $sth->bind_param( ":dbid",   get_dbid() );
+         $sth->bind_param( ":inst",   get_instance() );
+      }
+   }
+
+   $sth->execute();
+   ($bsnap, $esnap) = $sth->fetchrow_array();
+   $sth->finish();
+   if ($verbose) { printf("Final snap interval %s - %s\n", nvl($bsnap),nvl($esnap )); }
+   if ($bsnap==$esnap) { $bsnap--; }
+   return ($bsnap, $esnap);
+} # appropriate_range
+
+# --------------------------------------------------------------------------
+=head1 display_range
+   Renvoie une chaîne décrivant l'intervalle spécifié au format
+   "DD-MM-YYYY HH24:MI (bsnap) <=> DD-MM-YYYY HH24:MI (esnap)
+=over 3
+   =item dbh
+      Handle live de la base de données
+   =item min
+      debut de l'intervalle à considérer (snap_id)
+   =item max
+      fin de l'intervalle à considérer (snap_id)
+=back
+=cut
+sub display_range {
+   my ($dbh, $min, $max) = @_;
+   my $sth = $dbh->prepare( qq(
+      select 
+      to_char( min(begin_interval_time),'$DATEFORMAT') , 
+      to_char( max(end_interval_time) ,'$DATEFORMAT')
+      from dba_hist_snapshot 
+      where snap_id between :bsnap and :esnap
+      and dbid = :dbid
+      and instance_number = :inst
+      )
+   );
+   $sth->bind_param( ":bsnap", $min );
+   $sth->bind_param( ":esnap", $max );
+   $sth->bind_param( ":dbid",  get_dbid());
+   $sth->bind_param( ":inst",  get_instance());
+
+   $sth->execute();
+   my ($bint, $eint) = $sth->fetchrow_array();
+   $sth->finish();
+   return sprintf( "%s (%ld) <=> %s (%ld)", $bint, $min, $eint, $max );
+} # display_range
+
+# --------------------------------------------------------------------------
+=head1 retrieve_binds
+   Recupère les bind variables utilisées pour un ordre donné dans un
+   intervalle
+=over 3
+   =item dbh
+      Handle live de la base de données
+   =item sql_id
+      L'identifiant de l'ordre que l'on extrait
+   =item min
+      debut de l'intervalle à considérer (snap_id)
+   =item max
+      fin de l'intervalle à considérer (snap_id)
+=back
+=cut
+sub retrieve_binds {
+   my ($dbh, $sql_id, $min, $max ) = @_;
+   # printf( "%s - %d %d\n", $sql_id, $min, $max );
+   my %iparams;
+   my $sth = $dbh->prepare( q(
+		select name, min(position) pos from dba_hist_sql_bind_metadata 
+		where sql_id = :sql_id
+      group by name
+		order by min(position)
+	));
+   $sth->bind_param( ":sql_id",  $sql_id );
+   $sth->execute();
+   while (my ($param, $pos) = $sth->fetchrow_array()) {
+   $iparams{ $param } = $pos;
+   }
+   $sth->finish();
+
+   my $qry = "select to_char(begin_interval_time, 'YYYY/MM/DD HH24:MI')";
+   my $fmt = "%s";
+   my $header = "date                ";
+   for my $parname (sort keys %iparams) {
+   	$qry .= ",nvl(dbms_sqltune.extract_bind( bind_data,". $iparams{$parname} . ").value_string, '<NULL>')";
+	   $header .= "\t;" . $parname ;
+	   $fmt .= "\t;%s";
+   }
+   $header .= "\n";
+   $fmt .= "\n";
+
+   $qry .= q(
+      from dba_hist_sqlstat a, dba_hist_snapshot b
+      where
+         sql_id = :sql_id
+      and a.snap_id = b.snap_id
+      and a.snap_id between :min and :max
+      order by a.snap_id
+   );
+   $sth = $dbh->prepare( $qry );
+
+   $sth->bind_param( ":sql_id",  $sql_id );
+   $sth->bind_param( ":min", $min );
+   $sth->bind_param( ":max", $max );
+   $sth->execute();
+   print "Parameters:\n------------\n";
+   print $header;
+   while (my ($date, @values) = $sth->fetchrow_array()) {
+      printf( $fmt, $date, @values);
+   }
+   $sth->finish();
+} # retrieve_binds
+
+# --------------------------------------------------------------------------
+=head1 get_dbid
+   Renvoie l'identifiant de base courant
+
+=head2 paramètres
+=over 3
+   =item dbh
+      Handle live de la base de données
+=back
+On utilise une variable statique à l'ancienne, définie dans un 
+bloc englobant la fonction.
+=cut   
+{
+   my $dbid=0;
+   my $dbname='';
+
+   sub get_dbid {
+      if (!$dbid) { 
+         my $dbh = shift;
+         my $sth = $dbh->prepare( q( select dbid from v$database));
+         $sth->execute();
+         ($dbid) = $sth->fetchrow_array();
+      }
+      return $dbid;
+   } # get_dbid
+
+   sub get_dbname {
+      if (!$dbname) { 
+         my $dbh = shift;
+         my $sth = $dbh->prepare( q( select name from v$database));
+         $sth->execute();
+         ($dbname) = $sth->fetchrow_array();
+      }
+      return $dbname;
+   } # get_dbname
+}
+
+# --------------------------------------------------------------------------
+=head1 get_instance
+   Renvoie l'identifiant d'instance pertinent
+   WARNING: ne fonctionne pas sur des historiques AWR importés
+=head2 paramètres
+=over 3
+   =item dbh
+      Handle live de la base de données
+   =item inst
+      Instance recherchée
+=back
+On utilise une variable statique à l'ancienne, définie dans un 
+bloc englobant la fonction.
+=cut   
+{
+   my $instance=0;
+   sub get_instance {
+      if (!$instance) { 
+         my ($dbh, $inst) = @_;
+         my $sth;
+	 if ($inst) { # instance number was specified, check it exists
+         	$sth = $dbh->prepare( q( 
+             		select instance_number from gv$instance
+             		where instance_number = :inst
+         		));
+         		$sth->bind_param( ":inst", $inst );
+         } else {     # instance number was unspecified, get current 
+               $sth = $dbh->prepare( q(
+                        select userenv('instance') from dual
+                        ));
+         }
+         $sth->execute();
+         ($instance) = $sth->fetchrow_array();
+         $sth->finish();
+         if (!$instance) {
+		die "Cant find instance $inst in database";
+	 }
+      }
+      return $instance;
+   } # get_instance
+} # get_instance block
+
+# --------------------------------------------------------------------------
+=head1 get_sql_text
+   Renvoie l'ordre SQL correspondant au sql_id passé en paramètre
+=head2 paramètres
+=over 3
+   =item dbh
+      Handle live de la base de données
+   =item sql_id
+      L'identifiant de l'ordre que l'on extrait
+   =item wrap
+      La taille de ligne à utiliser pour plier l'ordre SQL
+      les valeurs <= 0 indiquent qu'on ne plie pas.
+=back
+=cut   
+sub get_sql_text {
+   my ($dbh,$sql_id,$wrap) = @_;
+
+   sub read_lob {
+     my ( $dbh, $clob ) = @_;
+   
+     my $BLOCK_SIZE = 8192;
+   
+     my $out;
+     my $offset = 1;
+   
+     while ( my $data = $dbh->ora_lob_read( $clob, $offset, $BLOCK_SIZE ) ) {
+       $out .= $data;
+       $offset += $BLOCK_SIZE;
+     }
+     return $out;
+   }
+   my $sth = $dbh->prepare( "select sql_text from dba_hist_sqltext where sql_id = :sql_id" , { ora_auto_lob => 0 });
+   $sth->bind_param( ":sql_id", $sql_id  );
+   $sth->execute();
+   my ($lobh) = $sth->fetchrow_array(); 
+   my $res = read_lob($dbh, $lobh);
+   $sth->finish();
+   if ($wrap>0) {
+      use Text::Wrap;
+      $Text::Wrap::columns = $wrap;
+      $res = wrap( '','',$res );
+   }
+   return $res;
+} # get_sql_text
+
+# --------------------------------------------------------------------------
+=head1 display_sqlid
+   Affiche les rapports AWR pour un sql donné et un intervalle donné
+   
+=head2 paramètres
+=over 3
+   =item dbh
+      Handle live de la base de données
+   =item sql_id
+      L'identifiant de l'ordre que l'on extrait
+   =item binds
+      flag indiquant si on doit afficher les binds var ou non
+   =item start
+      debut de l'intervalle à considérer
+   =item start
+      fin de l'intervalle à considérer
+=back
+=cut   
+sub display_sqlid {
+   my ($dbh, $sql_id, $binds, $start, $end ) = @_;
+
+   printf("%s\nWorking on sql_id %s\n", $banner, $sql_id );
+   
+   # On détermine l'intervalle adéquat
+   my ($begin_snap, $end_snap) = appropriate_range( $dbh, $sql_id, $start, $end );
+   
+   if (! (defined $begin_snap && defined $end_snap) ) {
+      printf("sql_id %s not found in current interval ", $sql_id ); 
+      exit(0);
+   }
+   
+   my $dbid = get_dbid();
+   my $inst = get_instance();
+
+   # --------------------------------------------------------------------------
+   # Extraction du report AWR correspondant à l'intervalle 
+   
+   printf( "\nExtracting awrsql report for snaps %d to %d\n", $begin_snap, $end_snap );
+   
+   
+   my $sth = $dbh->prepare( q(
+   select * from table(dbms_workload_repository.AWR_SQL_REPORT_TEXT( :dbid, :inst, :bid, :eid, :sql_id))
+   ));
+   $sth->bind_param( ":dbid",   $dbid );
+   $sth->bind_param( ":inst",   $inst );
+   $sth->bind_param( ":bid",    $begin_snap );
+   $sth->bind_param( ":eid",    $end_snap );
+   $sth->bind_param( ":sql_id", $sql_id );
+   $sth->execute();
+   while (my ($res) = $sth->fetchrow_array() ) { 
+      printf( "%s\n", $res ); 
+      if ($res =~ /^Full SQL Text/) { last; }
+   }
+   $sth->finish();
+   printf( "%s\n", get_sql_text($dbh, $sql_id, $wrap ) );
+   
+   if (defined $binds) { retrieve_binds( $dbh, $sql_id, $begin_snap, $end_snap ); }
+} # display_sqlid
+
+
+# --------------------------------------------------------------------------
+=head1 display_top
+   Affiche un top N des requêtes sur l'intervalle donné
+   
+=head2 paramètres
+=over 3
+   =item dbh
+      Handle live de la base de données
+   =item top
+      Nombre de sql à afficher
+   =item sort
+      Critere de tri (cf &usage)
+   =item start
+      Debut de l'intervalle (date au format $DATEFORMAT)
+   =item end
+      Fin de l'intervalle (date au format $DATEFORMAT)
+   =item plsql
+      1 ou 0 selon qu'il faut inclure ou non le PLSQL dans l'historique
+=back
+=cut
+sub display_top {
+   my ($dbh, $top, $sort, $start, $end, $pl) = @_;
+
+   my $costkey = get_sort_key( $sort );
+
+   my ($bsnap,$esnap) = appropriate_range( $dbh, undef, $start, $end);
+   printf("%s\n", $banner );
+   printf( "Top qry (%s) for %s (%s instance %d)\n", $sort, display_range( $dbh, $bsnap,$esnap), get_dbname(), get_instance()) unless $bare;
+
+   my $qry = qq(
+   select sql_id, plan_hash_value,
+      substr(module,1,19) module, execs, buffer_gets, disk_reads,
+      cpu_time, 
+      cpu_per_exec, 
+      elapsed_time, 
+      elapsed_per_exec,
+      iowait, 
+      sum( contrib) over (order by contrib desc ) as upto
+   from
+      (
+      select sql_id, plan_hash_value, module, execs, buffer_gets, disk_reads, cpu_time,
+         cpu_per_exec, elapsed_time, elapsed_per_exec, iowait,
+         ratio_to_report( $costkey ) over () as contrib
+      from
+         (
+         select sql_id, plan_hash_value, module, execs, buffer_gets, disk_reads, 
+         cpu_time, decode( execs, 0, null, cpu_time / execs ) cpu_per_exec,
+         elapsed_time, decode( execs, 0, null, elapsed_time / execs ) elapsed_per_exec,
+         iowait from
+            (
+            select
+                    a.sql_id,
+                    plan_hash_value,
+                    module,
+                    sum( EXECUTIONS_DELTA ) execs,
+                    sum( BUFFER_GETS_DELTA ) buffer_gets,
+                    sum( DISK_READS_DELTA ) disk_reads,
+                    sum( CPU_TIME_DELTA ) / 1000000 cpu_time,
+                    sum( ELAPSED_TIME_DELTA ) / 1000000 elapsed_time,
+                    sum( IOWAIT_DELTA ) / 1000000  iowait
+            from dba_hist_sqlstat a,
+                 dba_hist_snapshot b,
+		 dba_hist_sqltext c
+            where
+                  a.snap_id = b.snap_id
+            and   b.snap_id between :bsnap and :esnap
+            and   a.dbid = b.dbid
+            and   a.instance_number = b.instance_number
+            and   b.instance_number = :inst
+            and   b.dbid = :dbid
+	    and   c.sql_id = a.sql_id
+            and   (c.command_type != 47 or 1 = $pl)
+            group by
+                    a.sql_id ,
+                    plan_hash_value,
+                    module
+            )
+         )
+      )
+   order by contrib desc
+   );
+
+      my ($sql_id, $plan_hash, $module, $execs, 
+            $buffer_gets, $disk_reads, 
+            $cpu_time, $cpupx,
+            $elapsed_time, $elapx,
+            $iowait,
+            $sumpct );
+   if ($verbose) { print "About to parse the cost query\n" ; } 
+   my $sth = $dbh->prepare( $qry );
+   $sth->bind_param( ":bsnap", $bsnap );
+   $sth->bind_param( ":esnap", $esnap );
+   $sth->bind_param( ":inst",  get_instance() );
+   $sth->bind_param( ":dbid",  get_dbid() );
+   if ($verbose) { print "About to execute the cost query\n" ; } 
+   $sth->execute();
+
+   if (!$bare) {
+   print "sql_id       plan           module              execs            logical rds   physical rds        cpu (s)   cpu/exe    elapsed (s)   ela/exe    IO wait (s)      \%\n";
+   print "------------ -------------- ------------------- ------------- -------------- -------------- -------------- --------- -------------- --------- -------------- -----+\n";
+   }
+   my $topcnt=0;
+   while (
+      ($sql_id, $plan_hash, $module, $execs, 
+            $buffer_gets, $disk_reads, 
+            $cpu_time, $cpupx,
+            $elapsed_time, $elapx,
+            $iowait,
+            $sumpct ) = $sth->fetchrow_array() ) {
+      $topcnt++;
+      printf( "% 12s %14ld %-19s %13ld %14ld %14ld %14ld %9.3f %14ld %9.3f %14ld %5.2f\n", 
+         $sql_id, $plan_hash, $module, $execs,
+            $buffer_gets, $disk_reads,
+            $cpu_time, $cpupx,
+            $elapsed_time, $elapx,
+            $iowait,
+            $sumpct );
+      if ($topcnt==$top) { 
+         if (!$bare) {
+         print "------------ -------------- ------------------- ------------- -------------- -------------- -------------- --------- -------------- --------- -------------- -----=\n";
+         }
+         last; 
+      }
+   }
+} # display_top
+
+# --------------------------------------------------------------------------
+=head1 display_history
+   Affiche l'historique d'un SQL donné
+   
+=head2 paramètres
+=over 3
+   =item dbh
+      Handle live de la base de données
+   =item sql_id
+      ordre pour lequel on cherche l'historique
+   =item bdate
+      Debut de l'intervalle (date au format $DATEFORMAT)
+   =item edate
+      Fin de l'intervalle (date au format $DATEFORMAT)
+   =item inst
+      Instance pertinente
+=back
+=cut
+sub display_history {
+   my ($dbh, $sql_id, $bdate, $edate, $inst) = @_;
+
+   printf( "%s\nHistory of %s (instance %s)\n", $banner, $sql_id, ($inst>0)?$inst:"all") unless $bare;
+
+   my $qry = qq(
+   select to_char(b.begin_interval_time,'$DATEFORMAT'), 
+          plan_hash_value,
+          a.instance_number,
+          EXECUTIONS_DELTA,
+          BUFFER_GETS_DELTA,
+          DISK_READS_DELTA,
+          CPU_TIME_DELTA / 1000,
+          ELAPSED_TIME_DELTA / 1000,
+          case when EXECUTIONS_DELTA = 0 then -1 else CPU_TIME_DELTA / (EXECUTIONS_DELTA*1000) end,
+          case when EXECUTIONS_DELTA = 0 then -1 else ELAPSED_TIME_DELTA / (EXECUTIONS_DELTA*1000) end
+   from dba_hist_sqlstat a,
+        dba_hist_snapshot b
+   where
+         a.sql_id = :sql_id
+   and   a.snap_id = b.snap_id
+   and   a.dbid = b.dbid
+   and   b.dbid = :dbid
+   and   a.instance_number = b.instance_number
+   and   (:inst<1 or b.instance_number = :inst)
+--   and   a.plan_hash_value > 0
+   and   b.end_interval_time > to_date(nvl(:bdate,'1970-01-01 00:00:00'),'$DATEFORMAT')
+   and   b.begin_interval_time < to_date(nvl(:edate,'2970-01-01 00:00:00'),'$DATEFORMAT')
+   order by
+         b.snap_id,
+         a.instance_number,
+         a.plan_hash_value,
+         a.executions_delta
+   );     
+          
+   if ($verbose) { print "About to parse the history query\n" ; } 
+   my $sth = $dbh->prepare( $qry );
+   $sth->bind_param( ":sql_id",$sql_id );
+   $sth->bind_param( ":dbid",  get_dbid() );
+   $sth->bind_param( ":bdate", $bdate );
+   $sth->bind_param( ":edate", $edate );
+   $sth->bind_param( ":inst",  $inst );
+   if ($verbose) { print "About to execute the history query\n" ; } 
+   $sth->execute();
+
+   if (!$bare) {
+   print "Date                 Inst Plan          Execs          LReads         PReads         CPU(ms)        Elapsed(ms)    CPU(ms)/exec   Ela(ms)/exec\n";
+   print "-------------------- ---- ------------- -------------- -------------- -------------- -------------- -------------- -------------- --------------+\n";
+   }
+   while ( my ($date, $plan_hash, $instance, $execs, $buffer_gets, $disk_reads, $cpu_time, $elapsed_time, $cpupx, $elapx )
+            = $sth->fetchrow_array() ) {
+      printf( "%20s %4d % 13ld % 14ld % 14ld % 14ld % 14ld % 14ld % 14.3f % 14.3f\n",
+            $date, $instance, $plan_hash, $execs,
+            $buffer_gets, $disk_reads, $cpu_time, 
+            $elapsed_time, $cpupx, $elapx );
+   }
+} # display_history
+# ===================== main ======================================
+main();
