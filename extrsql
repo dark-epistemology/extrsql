@@ -11,7 +11,7 @@ our $verbose;
 our $wrap=80;
 our $bare=0;
 
-my $banner="extrsql v" . $maj . "." . $min . " - ccsgbd 2016";
+my $banner="extrsql v" . $maj . "." . $min . " - nop 2016";
 
 # forward declarations
 sub display_top;      
@@ -20,7 +20,7 @@ sub display_sqlid;
 sub get_dbid;
 
 my $DATEFORMAT="YYYYMMDDHH24MISS";
-my $DISPLAYDATEFORMAT="YYYY-MM-DD HH24:MI:SS";
+my $DISPLAYDATEFORMAT="YYYY-MM-DD HH24:MI";
 
 # --------------------------------------------------------------------------
 =head1 usage
@@ -757,16 +757,17 @@ sub display_history {
    printf( "%s\nHistory of %s (instance %s)\n", $banner, $sql_id, ($inst>0)?$inst:"all") unless $bare;
 
    my $qry = qq(
-   select to_char(b.begin_interval_time,'$DATEFORMAT'), 
+   select to_char(b.begin_interval_time,'$DISPLAYDATEFORMAT'), 
           plan_hash_value,
           a.instance_number,
           EXECUTIONS_DELTA,
-          BUFFER_GETS_DELTA,
-          DISK_READS_DELTA,
+          case when EXECUTIONS_DELTA = 0 then -1 else BUFFER_GETS_DELTA / EXECUTIONS_DELTA end,
+          case when EXECUTIONS_DELTA = 0 then -1 else DISK_READS_DELTA / EXECUTIONS_DELTA end,
           CPU_TIME_DELTA / 1000,
           ELAPSED_TIME_DELTA / 1000,
           case when EXECUTIONS_DELTA = 0 then -1 else CPU_TIME_DELTA / (EXECUTIONS_DELTA*1000) end,
-          case when EXECUTIONS_DELTA = 0 then -1 else ELAPSED_TIME_DELTA / (EXECUTIONS_DELTA*1000) end
+          case when EXECUTIONS_DELTA = 0 then -1 else ELAPSED_TIME_DELTA / (EXECUTIONS_DELTA*1000) end,
+          case when EXECUTIONS_DELTA = 0 then -1 else round( ROWS_PROCESSED_DELTA / EXECUTIONS_DELTA) end
    from dba_hist_sqlstat a,
         dba_hist_snapshot b
    where
@@ -777,8 +778,9 @@ sub display_history {
    and   a.instance_number = b.instance_number
    and   (:inst<1 or b.instance_number = :inst)
 --   and   a.plan_hash_value > 0
-   and   b.end_interval_time > to_date(nvl(:bdate,'1970-01-01 00:00:00'),'$DATEFORMAT')
-   and   b.begin_interval_time < to_date(nvl(:edate,'2970-01-01 00:00:00'),'$DATEFORMAT')
+   and  ( b.end_interval_time > to_date(:bdate,'$DATEFORMAT') or :bdate is null )
+   and  ( b.begin_interval_time < to_date(:edate,'$DATEFORMAT') or :edate is null )
+   and  ELAPSED_TIME_DELTA > 0
    order by
          b.snap_id,
          a.instance_number,
@@ -797,15 +799,15 @@ sub display_history {
    $sth->execute();
 
    if (!$bare) {
-   print "Date                 Inst Plan          Execs          LReads         PReads         CPU(ms)        Elapsed(ms)    CPU(ms)/exec   Ela(ms)/exec\n";
-   print "-------------------- ---- ------------- -------------- -------------- -------------- -------------- -------------- -------------- --------------+\n";
+   print "Date                 Inst Plan          Execs          LReads         PReads         CPU(ms)        Elapsed(ms)    CPU(ms)/exec   Ela(ms)/exec      Rows/exec\n";
+   print "-------------------- ---- ------------- -------------- -------------- -------------- -------------- -------------- -------------- -------------- -----------+\n";
    }
-   while ( my ($date, $plan_hash, $instance, $execs, $buffer_gets, $disk_reads, $cpu_time, $elapsed_time, $cpupx, $elapx )
+   while ( my ($date, $plan_hash, $instance, $execs, $buffer_gets, $disk_reads, $cpu_time, $elapsed_time, $cpupx, $elapx, $rowspx )
             = $sth->fetchrow_array() ) {
-      printf( "%20s %4d % 13ld % 14ld % 14ld % 14ld % 14ld % 14ld % 14.3f % 14.3f\n",
+      printf( "%20s %4d % 13ld % 14ld % 14.3f % 14.3f % 14ld % 14ld % 14.3f % 14.3f % 10d\n",
             $date, $instance, $plan_hash, $execs,
             $buffer_gets, $disk_reads, $cpu_time, 
-            $elapsed_time, $cpupx, $elapx );
+            $elapsed_time, $cpupx, $elapx, $rowspx );
    }
 } # display_history
 # ===================== main ======================================
